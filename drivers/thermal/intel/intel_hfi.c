@@ -413,13 +413,14 @@ static bool hfi_disable_if_enabled(void)
 }
 
 /**
- * intel_hfi_online() - Enable HFI on @cpu
- * @cpu:	CPU in which the HFI will be enabled
+ * intel_hfi_online() - Set up HFI on @cpu
+ * @cpu:	CPU that is coming online
  *
- * Enable the HFI to be used in @cpu. The HFI is enabled at the package
- * level. The first CPU in the package to come online does the full HFI
- * initialization. Subsequent CPUs will just link themselves to the HFI
- * instance of their package.
+ * The HFI is enabled at the package level. The first CPU in the package to
+ * come online does the full HFI initialization, which includes disabling HFI
+ * if a previous kernel left it enabled. HFI is enabled only when there are
+ * thermal netlink clients. Subsequent CPUs will just link themselves to the
+ * HFI instance of their package.
  *
  * This function is called before enabling the thermal vector in the local APIC
  * in order to ensure that @cpu has an associated HFI instance when it receives
@@ -461,6 +462,14 @@ void intel_hfi_online(unsigned int cpu)
 	mutex_lock(&hfi_instance_lock);
 	if (hfi_instance->hdr)
 		goto enable;
+
+	/*
+	 * A previous kernel may have left HFI enabled across kexec. Hardware
+	 * would keep writing to that kernel's table, in memory this kernel now
+	 * owns.
+	 */
+	if (hfi_disable_if_enabled())
+		pr_info("HFI left enabled on package %u, disabled\n", pkg_id);
 
 	/*
 	 * Hardware is programmed with the physical address of the first page
