@@ -161,6 +161,7 @@ static DEFINE_PER_CPU(struct hfi_cpu_info, hfi_cpu_info) = { .index = -1 };
 
 static int max_hfi_instances;
 static int hfi_clients_nr;
+static bool hfi_shutdown_done;
 static struct hfi_instance *hfi_instances;
 
 static struct hfi_features hfi_features;
@@ -398,14 +399,28 @@ static void hfi_disable(void)
 	}
 }
 
+/* Caller must hold hfi_instance_lock. */
+static bool hfi_disable_if_enabled(void)
+{
+	u64 msr_val;
+
+	rdmsrq(MSR_IA32_HW_FEEDBACK_CONFIG, msr_val);
+	if (!(msr_val & HW_FEEDBACK_CONFIG_HFI_ENABLE_BIT))
+		return false;
+
+	hfi_disable();
+	return true;
+}
+
 /**
- * intel_hfi_online() - Enable HFI on @cpu
- * @cpu:	CPU in which the HFI will be enabled
+ * intel_hfi_online() - Set up HFI on @cpu
+ * @cpu:	CPU that is coming online
  *
- * Enable the HFI to be used in @cpu. The HFI is enabled at the package
- * level. The first CPU in the package to come online does the full HFI
- * initialization. Subsequent CPUs will just link themselves to the HFI
- * instance of their package.
+ * The HFI is enabled at the package level. The first CPU in the package to
+ * come online does the full HFI initialization, which includes disabling HFI
+ * if a previous kernel left it enabled. HFI is enabled only when there are
+ * thermal netlink clients. Subsequent CPUs will just link themselves to the
+ * HFI instance of their package.
  *
  * This function is called before enabling the thermal vector in the local APIC
  * in order to ensure that @cpu has an associated HFI instance when it receives
@@ -449,6 +464,14 @@ void intel_hfi_online(unsigned int cpu)
 		goto enable;
 
 	/*
+	 * A previous kernel may have left HFI enabled across kexec. Hardware
+	 * would keep writing to that kernel's table, in memory this kernel now
+	 * owns.
+	 */
+	if (hfi_disable_if_enabled())
+		pr_info("HFI left enabled on package %u, disabled\n", pkg_id);
+
+	/*
 	 * Hardware is programmed with the physical address of the first page
 	 * frame of the table. Hence, the allocated memory must be page-aligned.
 	 *
@@ -483,7 +506,8 @@ enable:
 	 * Enable this HFI instance if this is its first online CPU and
 	 * there are user-space clients of thermal events.
 	 */
-	if (cpumask_weight(hfi_instance->cpus) == 1 && hfi_clients_nr > 0) {
+	if (cpumask_weight(hfi_instance->cpus) == 1 && hfi_clients_nr > 0 &&
+	    !hfi_shutdown_done) {
 		hfi_set_hw_table(hfi_instance);
 		hfi_enable();
 	}
@@ -593,6 +617,11 @@ static void hfi_disable_instance(void *ptr)
 	hfi_disable();
 }
 
+static void hfi_shutdown_instance(void *ptr)
+{
+	hfi_disable_if_enabled();
+}
+
 static void hfi_syscore_resume(void *data)
 {
 	/* This code runs only on the boot CPU. */
@@ -612,9 +641,35 @@ static int hfi_syscore_suspend(void *data)
 	return 0;
 }
 
+static void hfi_syscore_shutdown(void *data)
+{
+	struct hfi_instance *hfi_instance;
+	int i;
+
+	/*
+	 * Hardware keeps writing to the HFI table after a kexec, into memory
+	 * that the next kernel owns. Disable HFI in every package, and keep it
+	 * disabled: user space runs until machine_shutdown() stops the other
+	 * CPUs, and kexec enables CPU hotplug again, so a new thermal netlink
+	 * client or a CPU coming online could otherwise enable it.
+	 */
+	mutex_lock(&hfi_instance_lock);
+	hfi_shutdown_done = true;
+	for (i = 0; i < max_hfi_instances; i++) {
+		hfi_instance = &hfi_instances[i];
+		if (cpumask_empty(hfi_instance->cpus))
+			continue;
+
+		smp_call_function_single(cpumask_any(hfi_instance->cpus),
+					 hfi_shutdown_instance, hfi_instance, true);
+	}
+	mutex_unlock(&hfi_instance_lock);
+}
+
 static const struct syscore_ops hfi_pm_ops = {
 	.resume = hfi_syscore_resume,
 	.suspend = hfi_syscore_suspend,
+	.shutdown = hfi_syscore_shutdown,
 };
 
 static struct syscore hfi_pm = {
@@ -649,7 +704,7 @@ static int hfi_thermal_notify(struct notifier_block *nb, unsigned long state,
 		break;
 	}
 
-	if (!func)
+	if (!func || hfi_shutdown_done)
 		goto out;
 
 	for (i = 0; i < max_hfi_instances; i++) {
